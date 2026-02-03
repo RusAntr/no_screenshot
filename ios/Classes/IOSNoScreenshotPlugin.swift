@@ -3,6 +3,8 @@ import UIKit
 import ScreenProtectorKit
 public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var screenProtectorKit: ScreenProtectorKit? = nil
+    private weak var attachedWindow: UIWindow? = nil
+    private var attachRetryScheduled: Bool = false
     private static var methodChannel: FlutterMethodChannel? = nil
     private static var eventChannel: FlutterEventChannel? = nil
     private static var preventScreenShot: Bool = false
@@ -21,8 +23,10 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
         super.init()
 
         // Restore the saved state from UserDefaults
-        let fetchVal = UserDefaults.standard.bool(forKey: IOSNoScreenshotPlugin.preventScreenShotKey)
-        updateScreenshotState(isScreenshotBlocked: fetchVal)
+        let blocked = UserDefaults.standard.bool(forKey: IOSNoScreenshotPlugin.preventScreenShotKey)
+        IOSNoScreenshotPlugin.preventScreenShot = blocked
+        updateSharedPreferencesState("")
+        // Window may not be ready during plugin init; attach/apply when the app becomes active.
     }
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -40,7 +44,6 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
     }
 
     public func applicationDidBecomeActive(_ application: UIApplication) {
-        attachWindowIfNeeded()
         fetchPersistedState()
     }
 
@@ -61,9 +64,9 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
     }
     func fetchPersistedState() {
         // Restore the saved state from UserDefaults
-        var fetchVal = UserDefaults.standard.bool(forKey: IOSNoScreenshotPlugin.preventScreenShotKey) ? IOSNoScreenshotPlugin.DISABLESCREENSHOT :IOSNoScreenshotPlugin.ENABLESCREENSHOT
-        updateScreenshotState(isScreenshotBlocked: fetchVal)
-        print("Fetched state: \(IOSNoScreenshotPlugin.preventScreenShot)")
+        let blocked = UserDefaults.standard.bool(forKey: IOSNoScreenshotPlugin.preventScreenShotKey)
+        updateScreenshotState(isScreenshotBlocked: blocked)
+        print("Fetched state: \(blocked)")
     }
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
@@ -87,13 +90,11 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
         }
     }
     private func shotOff() {
-        IOSNoScreenshotPlugin.preventScreenShot = IOSNoScreenshotPlugin.DISABLESCREENSHOT
-        screenProtectorKit?.enabledPreventScreenshot()
+        updateScreenshotState(isScreenshotBlocked: IOSNoScreenshotPlugin.DISABLESCREENSHOT)
         persistState()
     }
     private func shotOn() {
-        IOSNoScreenshotPlugin.preventScreenShot = IOSNoScreenshotPlugin.ENABLESCREENSHOT
-        screenProtectorKit?.disablePreventScreenshot()
+        updateScreenshotState(isScreenshotBlocked: IOSNoScreenshotPlugin.ENABLESCREENSHOT)
         persistState()
     }
     private func startListening() {
@@ -110,11 +111,19 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
     }
 
     private func updateScreenshotState(isScreenshotBlocked: Bool) {
-        attachWindowIfNeeded()
-        if isScreenshotBlocked {
-            screenProtectorKit?.enabledPreventScreenshot()
-        } else {
-            screenProtectorKit?.disablePreventScreenshot()
+        IOSNoScreenshotPlugin.preventScreenShot = isScreenshotBlocked
+        updateSharedPreferencesState("")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.ensureKitAttached()
+            guard let kit = self.screenProtectorKit else { return }
+
+            // Reset first to reduce cases where the protection overlay gets "stuck" after app switching.
+            kit.disablePreventScreenshot()
+            if isScreenshotBlocked {
+                kit.enabledPreventScreenshot()
+            }
         }
     }
     private func updateSharedPreferencesState(_ screenshotData: String) {
@@ -156,31 +165,57 @@ public class IOSNoScreenshotPlugin: NSObject, FlutterPlugin, FlutterStreamHandle
         }
     }
 
-    private func attachWindowIfNeeded() {
-        var activeWindow: UIWindow?
-
+    private func findBestWindow() -> UIWindow? {
         if #available(iOS 13.0, *) {
-            if let windowScene = UIApplication.shared.connectedScenes
-                .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
-               let active = windowScene.windows.first(where: { $0.isKeyWindow }) {
-                activeWindow = active
+            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            let foregroundScenes = scenes.filter {
+                $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive
             }
+
+            let foregroundWindows = foregroundScenes.flatMap { $0.windows }
+            if let key = foregroundWindows.first(where: { $0.isKeyWindow }) { return key }
+            if let visible = foregroundWindows.first(where: { !$0.isHidden && $0.alpha > 0 }) { return visible }
+
+            let anyWindows = scenes.flatMap { $0.windows }
+            if let key = anyWindows.first(where: { $0.isKeyWindow }) { return key }
+            return anyWindows.first(where: { !$0.isHidden && $0.alpha > 0 })
         } else {
-            activeWindow = UIApplication.shared.windows.filter {$0.isKeyWindow}.first
+            return UIApplication.shared.windows.first(where: { $0.isKeyWindow })
+        }
+    }
+
+    private func scheduleAttachRetryIfNeeded() {
+        guard !attachRetryScheduled else { return }
+        guard UIApplication.shared.applicationState != .background else { return }
+        attachRetryScheduled = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard let self = self else { return }
+            self.attachRetryScheduled = false
+            // Re-apply the state; this will try attaching again.
+            self.updateScreenshotState(isScreenshotBlocked: IOSNoScreenshotPlugin.preventScreenShot)
+        }
+    }
+
+    private func ensureKitAttached() {
+        guard let window = findBestWindow() else {
+            scheduleAttachRetryIfNeeded()
+            return
         }
 
-        if let window = activeWindow {
-            // Work around: ScreenProtectorKit adds a new UI component to disable screenshots.
-            // The new instance will not be able to disable it anymore, therefore we need to turn it off using the old instance.
-            self.screenProtectorKit?.disablePreventScreenshot()
+        if attachedWindow === window, screenProtectorKit != nil { return }
 
-            // A new instance is created because otherwise we observed app hangs when taking screenshots.
-            let kit = ScreenProtectorKit(window: window)
-            kit.configurePreventionScreenshot()
-            self.screenProtectorKit = kit
-        } else {
-            print("❗️No active window found to attach ScreenProtectorKit.")
+        // Work around: ScreenProtectorKit adds a new UI component to disable screenshots.
+        // The new instance will not be able to disable it anymore, therefore we need to turn it off using the old instance.
+        if let existing = screenProtectorKit {
+            existing.disablePreventScreenshot()
+            existing.removeAllObserver()
         }
+
+        let kit = ScreenProtectorKit(window: window)
+        kit.configurePreventionScreenshot()
+        screenProtectorKit = kit
+        attachedWindow = window
     }
 
 
